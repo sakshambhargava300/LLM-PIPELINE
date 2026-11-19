@@ -255,3 +255,40 @@ export const BERT_EMBEDDING_ITEMS: ComparisonEmbeddingItem[] = [
     note: 'Contextual BERT vector pulled toward "fisherman" and "river".',
   },
 ];
+
+export interface NeighborSimilarity<T extends ComparisonEmbeddingItem> {
+  item: T;
+  similarity: number;
+}
+
+export function cosineSimilarity(a: number[], b: number[]): number {
+  const len = Math.min(a.length, b.length);
+  if (len === 0) return 0;
+  let dot = 0;
+  let magA = 0;
+  let magB = 0;
+  for (let i = 0; i < len; i++) {
+    dot += a[i] * b[i];
+    magA += a[i] * a[i];
+    magB += b[i] * b[i];
+  }
+  const denom = Math.sqrt(magA) * Math.sqrt(magB);
+  if (denom < 1e-10) return 0;
+  return Math.round((dot / denom) * 1000) / 1000;
+}
+
+export function getNearestNeighbors<T extends ComparisonEmbeddingItem>(
+  target: T,
+  items: T[],
+  limit = 3,
+): NeighborSimilarity<T>[] {
+  return items
+    .filter((item) => item.id !== target.id)
+    .map((item) => ({
+      item,
+      similarity: cosineSimilarity(target.vector, item.vector),
+    }))
+    .sort((a, b) => b.similarity - a.similarity)
+    .slice(0, limit);
+}
+

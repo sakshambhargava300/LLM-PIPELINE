@@ -2,21 +2,54 @@ import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import type { ComparisonEmbeddingItem } from '../utils/embeddings';
+import {
+  cosineSimilarity,
+  getNearestNeighbors,
+  type ComparisonEmbeddingItem,
+} from '../utils/embeddings';
 
 export type ProjectedEmbeddingPoint = ComparisonEmbeddingItem & {
   coords3D: [number, number, number];
 };
 
+export type CameraPreset = 'iso' | 'top' | 'front' | 'side';
+
+export interface CameraPose {
+  position: [number, number, number];
+  target: [number, number, number];
+  sourceId: string;
+  nonce: number;
+}
+
 interface ScatterPlot3DProps {
+  plotId: string;
   title: string;
   subtitle: string;
   points: ProjectedEmbeddingPoint[];
   varianceExplained: [number, number, number];
   selectedPointId: string;
   onSelectPoint: (pointId: string) => void;
+  showLinks: boolean;
+  showClusters: boolean;
+  showLabels: boolean;
+  externalCameraPose: CameraPose | null;
+  onCameraPoseChange?: (pose: CameraPose) => void;
   testId: string;
 }
+
+interface HoverTooltipState {
+  point: ProjectedEmbeddingPoint;
+  x: number;
+  y: number;
+  similarityToSelected: number | null;
+}
+
+const PRESET_CAMERA_POSITIONS: Record<CameraPreset, [number, number, number]> = {
+  iso: [5.2, 3.6, 5.6],
+  top: [0.01, 7.6, 0.01],
+  front: [0, 0.4, 7.6],
+  side: [7.6, 0.4, 0],
+};
 
 function createTextLabelSprite(label: string, accentHex: string): THREE.Sprite {
   const canvas = document.createElement('canvas');
@@ -70,9 +103,40 @@ function createTextLabelSprite(label: string, accentHex: string): THREE.Sprite {
   });
   const sprite = new THREE.Sprite(material);
   const aspect = w / h;
-  const spriteHeight = 0.29;
+  const spriteHeight = 0.28;
   sprite.scale.set(spriteHeight * aspect, spriteHeight, 1);
   sprite.renderOrder = 10;
+  return sprite;
+}
+
+function createSimilarityBadgeSprite(scoreText: string, borderHex: string): THREE.Sprite {
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d')!;
+  canvas.width = 116;
+  canvas.height = 38;
+
+  ctx.fillStyle = '#FFFDF5';
+  ctx.strokeStyle = borderHex;
+  ctx.lineWidth = 2.5;
+  ctx.fillRect(2, 2, canvas.width - 4, canvas.height - 4);
+  ctx.strokeRect(2, 2, canvas.width - 4, canvas.height - 4);
+
+  ctx.font = '600 18px "IBM Plex Mono", monospace';
+  ctx.fillStyle = '#111111';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(scoreText, canvas.width / 2, canvas.height / 2);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  const material = new THREE.SpriteMaterial({
+    map: texture,
+    transparent: true,
+    depthTest: false,
+  });
+  const sprite = new THREE.Sprite(material);
+  sprite.scale.set(0.62, 0.21, 1);
+  sprite.renderOrder = 12;
   return sprite;
 }
 
@@ -100,30 +164,53 @@ function createAxisBadgeSprite(axisText: string): THREE.Sprite {
 }
 
 export function ScatterPlot3D({
+  plotId,
   title,
   subtitle,
   points,
   varianceExplained,
   selectedPointId,
   onSelectPoint,
+  showLinks,
+  showClusters,
+  showLabels,
+  externalCameraPose,
+  onCameraPoseChange,
   testId,
 }: ScatterPlot3DProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const onSelectRef = useRef(onSelectPoint);
+  const onCameraChangeRef = useRef(onCameraPoseChange);
   const selectedIdRef = useRef(selectedPointId);
+  const hoveredIdRef = useRef<string | null>(null);
+
   const selectionRingRef = useRef<THREE.Mesh | null>(null);
+  const floorMarkerRef = useRef<THREE.Mesh | null>(null);
   const pointMapRef = useRef<Map<string, THREE.Vector3>>(new Map());
+  const meshMapRef = useRef<Map<string, THREE.Mesh>>(new Map());
+  const labelGroupRef = useRef<THREE.Group | null>(null);
+  const clusterGroupRef = useRef<THREE.Group | null>(null);
+  const linksGroupRef = useRef<THREE.Group | null>(null);
+  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const controlsRef = useRef<OrbitControls | null>(null);
+  const isSoftwareGlRef = useRef<boolean>(false);
+  const suppressSyncRef = useRef<boolean>(false);
+  const transitionGoalRef = useRef<THREE.Vector3 | null>(null);
   const requestRenderRef = useRef<() => void>(() => {});
+
   const [webglError, setWebglError] = useState(false);
+  const [activePreset, setActivePreset] = useState<CameraPreset | null>('iso');
+  const [tooltip, setTooltip] = useState<HoverTooltipState | null>(null);
 
   onSelectRef.current = onSelectPoint;
+  onCameraChangeRef.current = onCameraPoseChange;
   selectedIdRef.current = selectedPointId;
 
+  // Build Three.js scene once per points array
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
 
-    // Software-WebGL probe
     const isSoftwareGl = (() => {
       try {
         const probe = document.createElement('canvas').getContext('webgl2');
@@ -137,6 +224,7 @@ export function ScatterPlot3D({
         return true;
       }
     })();
+    isSoftwareGlRef.current = isSoftwareGl;
 
     let renderer: THREE.WebGLRenderer;
     try {
@@ -184,7 +272,8 @@ export function ScatterPlot3D({
     pmremGenerator.dispose();
 
     const camera = new THREE.PerspectiveCamera(42, width / height, 0.1, 100);
-    camera.position.set(5.2, 3.6, 5.6);
+    camera.position.set(...PRESET_CAMERA_POSITIONS.iso);
+    cameraRef.current = camera;
 
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = !isSoftwareGl;
@@ -194,15 +283,16 @@ export function ScatterPlot3D({
     controls.maxDistance = 12;
     controls.target.set(0, 0, 0);
     controls.update();
+    controlsRef.current = controls;
 
     // Lighting
-    const hemiLight = new THREE.HemisphereLight(0xffffff, 0xe5e7eb, 1.1);
+    const hemiLight = new THREE.HemisphereLight(0xffffff, 0xe5e7eb, 1.15);
     scene.add(hemiLight);
     const keyLight = new THREE.DirectionalLight(0xfffbeb, 1.2);
     keyLight.position.set(5, 8, 6);
     scene.add(keyLight);
 
-    // Coordinate floor grid + subtle axes
+    // Coordinate floor grid + axes
     const floorY = -2.35;
     const grid = new THREE.GridHelper(5.2, 8, 0xd1d5db, 0xe5e7eb);
     grid.position.y = floorY;
@@ -214,15 +304,11 @@ export function ScatterPlot3D({
       [new THREE.Vector3(0, floorY, 0), new THREE.Vector3(0, 2.5, 0)],
       [new THREE.Vector3(0, 0, -2.6), new THREE.Vector3(0, 0, 2.6)],
     ];
-    const axisLines: THREE.Line[] = [];
     for (const pair of axisPoints) {
       const geo = new THREE.BufferGeometry().setFromPoints(pair);
-      const line = new THREE.Line(geo, axesMaterialX);
-      scene.add(line);
-      axisLines.push(line);
+      scene.add(new THREE.Line(geo, axesMaterialX));
     }
 
-    // Add data spheres, drop lines, and text label sprites
     const sphereGeo = new THREE.SphereGeometry(0.17, 24, 24);
     const clickableMeshes: THREE.Mesh[] = [];
     const createdMaterials: THREE.Material[] = [axesMaterialX];
@@ -241,14 +327,28 @@ export function ScatterPlot3D({
       if (sprite.material.map) createdTextures.push(sprite.material.map);
       createdMaterials.push(sprite.material);
     }
+
     const dropLineMat = new THREE.LineBasicMaterial({
       color: 0xd1d5db,
       transparent: true,
-      opacity: 0.75,
+      opacity: 0.65,
     });
     createdMaterials.push(dropLineMat);
 
+    const labelGroup = new THREE.Group();
+    scene.add(labelGroup);
+    labelGroupRef.current = labelGroup;
+
+    const clusterGroup = new THREE.Group();
+    scene.add(clusterGroup);
+    clusterGroupRef.current = clusterGroup;
+
+    const linksGroup = new THREE.Group();
+    scene.add(linksGroup);
+    linksGroupRef.current = linksGroup;
+
     const pointMap = new Map<string, THREE.Vector3>();
+    const meshMap = new Map<string, THREE.Mesh>();
 
     for (const pt of points) {
       const [px, py, pz] = pt.coords3D;
@@ -257,7 +357,7 @@ export function ScatterPlot3D({
 
       const mat = new THREE.MeshStandardMaterial({
         color: new THREE.Color(pt.colorHex),
-        roughness: 0.3,
+        roughness: 0.28,
         metalness: 0.12,
       });
       createdMaterials.push(mat);
@@ -267,48 +367,122 @@ export function ScatterPlot3D({
       mesh.userData.pointId = pt.id;
       scene.add(mesh);
       clickableMeshes.push(mesh);
+      meshMap.set(pt.id, mesh);
 
-      // Vertical guide line to grid floor
       const lineGeo = new THREE.BufferGeometry().setFromPoints([
         pos,
         new THREE.Vector3(px, floorY, pz),
       ]);
       createdGeometries.push(lineGeo);
-      const line = new THREE.Line(lineGeo, dropLineMat);
-      scene.add(line);
+      scene.add(new THREE.Line(lineGeo, dropLineMat));
 
-      // Crisp 3D sprite label
       const sprite = createTextLabelSprite(pt.label, pt.colorHex);
       sprite.position.set(px, py + 0.36, pz);
-      scene.add(sprite);
-      if (sprite.material.map) {
-        createdTextures.push(sprite.material.map);
-      }
+      labelGroup.add(sprite);
+      if (sprite.material.map) createdTextures.push(sprite.material.map);
       createdMaterials.push(sprite.material);
     }
 
     pointMapRef.current = pointMap;
+    meshMapRef.current = meshMap;
 
-    // Selection ring highlight
-    const ringGeo = new THREE.TorusGeometry(0.28, 0.024, 12, 32);
+    // Build cluster envelopes (Sentence 1 financial cluster vs Sentence 2 river cluster)
+    const buildClusterEnvelope = (
+      clusterIds: string[],
+      colorHex: number,
+    ) => {
+      const clusterVecs = clusterIds
+        .map((id) => pointMap.get(id))
+        .filter((v): v is THREE.Vector3 => Boolean(v));
+      if (clusterVecs.length < 2) return;
+
+      const centroid = new THREE.Vector3();
+      for (const v of clusterVecs) centroid.add(v);
+      centroid.divideScalar(clusterVecs.length);
+
+      let maxDist = 0.55;
+      for (const v of clusterVecs) {
+        maxDist = Math.max(maxDist, centroid.distanceTo(v) + 0.35);
+      }
+
+      const hullGeo = new THREE.SphereGeometry(maxDist, 20, 16);
+      const hullMat = new THREE.MeshBasicMaterial({
+        color: colorHex,
+        transparent: true,
+        opacity: 0.06,
+        depthWrite: false,
+      });
+      createdGeometries.push(hullGeo);
+      createdMaterials.push(hullMat);
+      const hullMesh = new THREE.Mesh(hullGeo, hullMat);
+      hullMesh.position.copy(centroid);
+      clusterGroup.add(hullMesh);
+
+      const floorRingGeo = new THREE.RingGeometry(maxDist * 0.72, maxDist * 0.78, 40);
+      floorRingGeo.rotateX(-Math.PI / 2);
+      const floorRingMat = new THREE.MeshBasicMaterial({
+        color: colorHex,
+        transparent: true,
+        opacity: 0.32,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      });
+      createdGeometries.push(floorRingGeo);
+      createdMaterials.push(floorRingMat);
+      const floorRing = new THREE.Mesh(floorRingGeo, floorRingMat);
+      floorRing.position.set(centroid.x, floorY + 0.015, centroid.z);
+      clusterGroup.add(floorRing);
+    };
+
+    const financeIds = points
+      .filter((p) => p.group === 'finance' || p.id === 'bert-bank-finance')
+      .map((p) => p.id);
+    const riverIds = points
+      .filter((p) => p.group === 'river' || p.id === 'bert-bank-river')
+      .map((p) => p.id);
+
+    buildClusterEnvelope(financeIds, 0x2563eb);
+    buildClusterEnvelope(riverIds, 0xf97316);
+
+    // Selection ring highlight + floor pulse ring
+    const ringGeo = new THREE.TorusGeometry(0.28, 0.026, 12, 32);
     const ringMat = new THREE.MeshBasicMaterial({ color: 0x111111 });
     createdGeometries.push(ringGeo);
     createdMaterials.push(ringMat);
     const ringMesh = new THREE.Mesh(ringGeo, ringMat);
-    const initialSelectedPos = pointMap.get(selectedIdRef.current);
-    if (initialSelectedPos) {
-      ringMesh.position.copy(initialSelectedPos);
-    } else {
-      ringMesh.visible = false;
-    }
     scene.add(ringMesh);
     selectionRingRef.current = ringMesh;
 
-    // Coalesced on-demand rendering
+    const floorMarkerGeo = new THREE.RingGeometry(0.18, 0.3, 32);
+    floorMarkerGeo.rotateX(-Math.PI / 2);
+    const floorMarkerMat = new THREE.MeshBasicMaterial({
+      color: 0x111111,
+      transparent: true,
+      opacity: 0.45,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    createdGeometries.push(floorMarkerGeo);
+    createdMaterials.push(floorMarkerMat);
+    const floorMarker = new THREE.Mesh(floorMarkerGeo, floorMarkerMat);
+    scene.add(floorMarker);
+    floorMarkerRef.current = floorMarker;
+
+    const initialSelectedPos = pointMap.get(selectedIdRef.current);
+    if (initialSelectedPos) {
+      ringMesh.position.copy(initialSelectedPos);
+      floorMarker.position.set(initialSelectedPos.x, floorY + 0.02, initialSelectedPos.z);
+    } else {
+      ringMesh.visible = false;
+      floorMarker.visible = false;
+    }
+
+    // Coalesced on-demand rendering + smooth camera preset transitions
     let frameId = 0;
     let renderBusy = false;
     let renderDirty = false;
     let disposed = false;
+    let lastTimestamp = performance.now();
 
     function afterDraw(cb: () => void) {
       const gl = renderer.getContext() as WebGL2RenderingContext;
@@ -337,17 +511,47 @@ export function ScatterPlot3D({
         return;
       }
       renderBusy = true;
-      frameId = requestAnimationFrame(() => {
+      frameId = requestAnimationFrame((now) => {
         if (disposed) return;
+        const delta = Math.min(0.05, (now - lastTimestamp) / 1000);
+        lastTimestamp = now;
         renderDirty = false;
+
+        let needsMoreFrames = false;
+        if (transitionGoalRef.current) {
+          const goal = transitionGoalRef.current;
+          if (isSoftwareGl) {
+            camera.position.copy(goal);
+            transitionGoalRef.current = null;
+          } else {
+            const alpha = 1 - Math.exp(-8 * delta);
+            camera.position.lerp(goal, alpha);
+            if (camera.position.distanceTo(goal) < 0.03) {
+              camera.position.copy(goal);
+              transitionGoalRef.current = null;
+            } else {
+              needsMoreFrames = true;
+            }
+          }
+        }
+
+        // Smooth scale highlight on hovered sphere
+        for (const [id, mesh] of meshMapRef.current.entries()) {
+          const targetScale = id === hoveredIdRef.current ? 1.26 : id === selectedIdRef.current ? 1.12 : 1;
+          mesh.scale.setScalar(targetScale);
+        }
+
         controls.update();
         if (selectionRingRef.current) {
           selectionRingRef.current.lookAt(camera.position);
         }
         renderer.render(scene, camera);
+
         const done = () => {
           renderBusy = false;
-          if (renderDirty && !disposed) requestRender();
+          if ((renderDirty || needsMoreFrames) && !disposed) {
+            requestRender();
+          }
         };
         if (isSoftwareGl) afterDraw(done);
         else done();
@@ -356,9 +560,26 @@ export function ScatterPlot3D({
 
     requestRenderRef.current = requestRender;
 
-    controls.addEventListener('change', requestRender);
+    const handleControlsStart = () => {
+      transitionGoalRef.current = null;
+      setActivePreset(null);
+    };
+    const handleControlsChange = () => {
+      requestRender();
+      if (!suppressSyncRef.current && onCameraChangeRef.current) {
+        onCameraChangeRef.current({
+          position: [camera.position.x, camera.position.y, camera.position.z],
+          target: [controls.target.x, controls.target.y, controls.target.z],
+          sourceId: plotId,
+          nonce: Date.now(),
+        });
+      }
+    };
 
-    // Raycasting for clicking points in 3D space
+    controls.addEventListener('start', handleControlsStart);
+    controls.addEventListener('change', handleControlsChange);
+
+    // Raycasting for clicking & hovering 3D points
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2();
     let downX = 0;
@@ -390,7 +611,7 @@ export function ScatterPlot3D({
     let lastHoverCheck = 0;
     const handlePointerMove = (e: PointerEvent) => {
       const now = performance.now();
-      if (now - lastHoverCheck < 50) return;
+      if (now - lastHoverCheck < 45) return;
       lastHoverCheck = now;
 
       const rect = renderer.domElement.getBoundingClientRect();
@@ -399,12 +620,48 @@ export function ScatterPlot3D({
       raycaster.setFromCamera(pointer, camera);
 
       const hits = raycaster.intersectObjects(clickableMeshes, false);
-      renderer.domElement.style.cursor = hits.length > 0 ? 'pointer' : 'grab';
+      if (hits.length > 0) {
+        const hitId = hits[0].object.userData.pointId as string;
+        const pt = points.find((p) => p.id === hitId);
+        if (pt) {
+          if (hoveredIdRef.current !== hitId) {
+            hoveredIdRef.current = hitId;
+            requestRender();
+          }
+          const selPt = points.find((p) => p.id === selectedIdRef.current);
+          const sim =
+            selPt && selPt.id !== pt.id ? cosineSimilarity(selPt.vector, pt.vector) : null;
+          setTooltip({
+            point: pt,
+            x: e.clientX - rect.left,
+            y: e.clientY - rect.top,
+            similarityToSelected: sim,
+          });
+          renderer.domElement.style.cursor = 'pointer';
+          return;
+        }
+      }
+
+      if (hoveredIdRef.current !== null) {
+        hoveredIdRef.current = null;
+        setTooltip(null);
+        requestRender();
+      }
+      renderer.domElement.style.cursor = 'grab';
+    };
+
+    const handlePointerLeave = () => {
+      if (hoveredIdRef.current !== null) {
+        hoveredIdRef.current = null;
+        requestRender();
+      }
+      setTooltip(null);
     };
 
     renderer.domElement.addEventListener('pointerdown', handlePointerDown);
     renderer.domElement.addEventListener('pointerup', handlePointerUp);
     renderer.domElement.addEventListener('pointermove', handlePointerMove);
+    renderer.domElement.addEventListener('pointerleave', handlePointerLeave);
 
     const resizeObserver = new ResizeObserver((entries) => {
       const entry = entries[0];
@@ -425,11 +682,13 @@ export function ScatterPlot3D({
       cancelAnimationFrame(frameId);
       clearTimeout(frameId);
       resizeObserver.disconnect();
-      controls.removeEventListener('change', requestRender);
+      controls.removeEventListener('start', handleControlsStart);
+      controls.removeEventListener('change', handleControlsChange);
       controls.dispose();
       renderer.domElement.removeEventListener('pointerdown', handlePointerDown);
       renderer.domElement.removeEventListener('pointerup', handlePointerUp);
       renderer.domElement.removeEventListener('pointermove', handlePointerMove);
+      renderer.domElement.removeEventListener('pointerleave', handlePointerLeave);
       renderer.domElement.removeEventListener('webglcontextlost', handleContextLost);
       renderer.domElement.removeEventListener('webglcontextrestored', handleContextRestored);
 
@@ -439,21 +698,131 @@ export function ScatterPlot3D({
       envTexture.dispose();
       renderer.dispose();
     };
-  }, [points]);
+  }, [points, plotId]);
 
-  // Move selection ring when selectedPointId changes without tearing down WebGL scene
+  // Update visibility of labels & cluster envelopes
   useEffect(() => {
-    const ring = selectionRingRef.current;
-    if (!ring) return;
-    const pos = pointMapRef.current.get(selectedPointId);
-    if (pos) {
-      ring.position.copy(pos);
-      ring.visible = true;
-    } else {
-      ring.visible = false;
+    if (labelGroupRef.current) {
+      labelGroupRef.current.visible = showLabels;
+    }
+    if (clusterGroupRef.current) {
+      clusterGroupRef.current.visible = showClusters;
     }
     requestRenderRef.current();
-  }, [selectedPointId]);
+  }, [showLabels, showClusters]);
+
+  // Update selection ring + dynamic similarity connector lines to nearest neighbors
+  useEffect(() => {
+    const floorY = -2.35;
+    const ring = selectionRingRef.current;
+    const floorMarker = floorMarkerRef.current;
+    const linksGroup = linksGroupRef.current;
+
+    const pos = pointMapRef.current.get(selectedPointId);
+    if (ring && floorMarker) {
+      if (pos) {
+        ring.position.copy(pos);
+        ring.visible = true;
+        floorMarker.position.set(pos.x, floorY + 0.02, pos.z);
+        floorMarker.visible = true;
+      } else {
+        ring.visible = false;
+        floorMarker.visible = false;
+      }
+    }
+
+    if (linksGroup) {
+      // Clear & dispose previous link geometries/materials
+      while (linksGroup.children.length > 0) {
+        const child = linksGroup.children[0];
+        linksGroup.remove(child);
+        if (child instanceof THREE.Line) {
+          child.geometry.dispose();
+          if (Array.isArray(child.material)) child.material.forEach((m) => m.dispose());
+          else child.material.dispose();
+        } else if (child instanceof THREE.Sprite) {
+          child.material.map?.dispose();
+          child.material.dispose();
+        }
+      }
+
+      if (showLinks && pos) {
+        const selectedPoint = points.find((p) => p.id === selectedPointId);
+        if (selectedPoint) {
+          const neighbors = getNearestNeighbors(selectedPoint, points, 3);
+          neighbors.forEach((neighbor, idx) => {
+            const targetPos = pointMapRef.current.get(neighbor.item.id);
+            if (!targetPos) return;
+
+            const isStrong = neighbor.similarity >= 0.45;
+            const lineGeo = new THREE.BufferGeometry().setFromPoints([pos, targetPos]);
+            const lineMat = new THREE.LineBasicMaterial({
+              color: isStrong ? 0x111111 : 0x9ca3af,
+              transparent: true,
+              opacity: isStrong ? 0.78 - idx * 0.14 : 0.45,
+            });
+            linksGroup.add(new THREE.Line(lineGeo, lineMat));
+
+            // Add cosine similarity badge at midpoint of top 2 nearest links
+            if (idx < 2) {
+              const mid = new THREE.Vector3().addVectors(pos, targetPos).multiplyScalar(0.5);
+              mid.y += 0.14;
+              const badge = createSimilarityBadgeSprite(
+                `cos ${neighbor.similarity.toFixed(2)}`,
+                isStrong ? '#111111' : '#9CA3AF',
+              );
+              badge.position.copy(mid);
+              linksGroup.add(badge);
+            }
+          });
+        }
+      }
+    }
+
+    requestRenderRef.current();
+  }, [selectedPointId, showLinks, points]);
+
+  // Mirror external camera pose when camera sync is active
+  useEffect(() => {
+    if (!externalCameraPose || externalCameraPose.sourceId === plotId) return;
+    const camera = cameraRef.current;
+    const controls = controlsRef.current;
+    if (!camera || !controls) return;
+
+    suppressSyncRef.current = true;
+    transitionGoalRef.current = null;
+    camera.position.set(...externalCameraPose.position);
+    controls.target.set(...externalCameraPose.target);
+    controls.update();
+    requestRenderRef.current();
+    suppressSyncRef.current = false;
+  }, [externalCameraPose, plotId]);
+
+  const handleSelectPreset = (preset: CameraPreset) => {
+    setActivePreset(preset);
+    const camera = cameraRef.current;
+    const controls = controlsRef.current;
+    if (!camera || !controls) return;
+
+    const targetPos = PRESET_CAMERA_POSITIONS[preset];
+    controls.target.set(0, 0, 0);
+    if (isSoftwareGlRef.current) {
+      camera.position.set(...targetPos);
+      controls.update();
+    } else {
+      transitionGoalRef.current = new THREE.Vector3(...targetPos);
+    }
+    requestRenderRef.current();
+
+    if (onCameraChangeRef.current) {
+      onCameraChangeRef.current({
+        position: targetPos,
+        target: [0, 0, 0],
+        sourceId: plotId,
+        nonce: Date.now(),
+      });
+    }
+  };
 
   return (
     <div className="border border-gray-200 rounded-xl bg-white overflow-hidden flex flex-col">
@@ -468,7 +837,35 @@ export function ScatterPlot3D({
         </span>
       </div>
 
-      <div className="relative w-full h-[320px] sm:h-[360px] bg-white">
+      {/* Camera angle preset strip */}
+      <div className="px-4 py-2 border-b border-gray-200 bg-white flex flex-wrap items-center justify-between gap-2">
+        <span className="text-[11px] font-medium text-gray-500">Camera Angle</span>
+        <div className="flex items-center gap-1" role="group" aria-label={`Camera views for ${title}`}>
+          {(
+            [
+              { id: 'iso', label: '3D Iso' },
+              { id: 'top', label: 'Top' },
+              { id: 'front', label: 'Front' },
+              { id: 'side', label: 'Side' },
+            ] as const
+          ).map((preset) => (
+            <button
+              key={preset.id}
+              type="button"
+              onClick={() => handleSelectPreset(preset.id)}
+              className={`px-2.5 py-1 rounded text-[11px] font-semibold transition-colors cursor-pointer ${
+                activePreset === preset.id
+                  ? 'bg-[#FFD43B] text-[#111111] border border-[#E5B800]'
+                  : 'bg-gray-50 hover:bg-gray-100 text-gray-700 border border-gray-200'
+              }`}
+            >
+              {preset.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="relative w-full h-[330px] sm:h-[370px] bg-white">
         {webglError ? (
           <div className="w-full h-full flex flex-col items-center justify-center p-6 text-center bg-gray-50">
             <p className="text-sm font-semibold text-[#111111]">
@@ -479,18 +876,45 @@ export function ScatterPlot3D({
             </p>
           </div>
         ) : (
-          <div
-            ref={containerRef}
-            data-testid={testId}
-            aria-label={`${title} interactive 3D PCA projection`}
-            className="w-full h-full"
-          />
+          <>
+            <div
+              ref={containerRef}
+              data-testid={testId}
+              aria-label={`${title} interactive 3D PCA projection`}
+              className="w-full h-full"
+            />
+            {tooltip && (
+              <div
+                className="pointer-events-none absolute z-10 max-w-[220px] rounded-lg border border-gray-300 bg-white px-3 py-2 shadow-sm text-xs"
+                style={{
+                  left: Math.min(tooltip.x + 14, 240),
+                  top: Math.max(8, tooltip.y - 48),
+                }}
+              >
+                <div className="font-mono font-bold text-[#111111] flex items-center gap-1.5">
+                  <span
+                    className="w-2 h-2 rounded-full shrink-0"
+                    style={{ backgroundColor: tooltip.point.colorHex }}
+                  />
+                  {tooltip.point.label}
+                </div>
+                <div className="text-[11px] text-gray-600 mt-0.5 leading-snug">
+                  {tooltip.point.note}
+                </div>
+                {tooltip.similarityToSelected !== null && (
+                  <div className="font-mono text-[11px] font-semibold text-[#111111] mt-1 tabular-nums">
+                    Cosine sim to selected: {tooltip.similarityToSelected.toFixed(2)}
+                  </div>
+                )}
+              </div>
+            )}
+          </>
         )}
       </div>
 
       <div className="px-4 py-3 border-t border-gray-200 bg-white space-y-2">
-        <div className="flex items-center justify-between text-xs text-gray-500">
-          <span>Drag to rotate · Scroll to zoom · Click a sphere or button to inspect vector</span>
+        <div className="text-xs text-gray-500">
+          Drag to rotate · Scroll to zoom · Hover or click any sphere to explore nearest neighbors
         </div>
         <div className="flex flex-wrap gap-1.5" role="group" aria-label={`Select word in ${title}`}>
           {points.map((pt) => {

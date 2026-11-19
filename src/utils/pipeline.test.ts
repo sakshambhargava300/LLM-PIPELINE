@@ -13,6 +13,8 @@ import {
   getIllustrativeEmbedding,
   WORD2VEC_EMBEDDING_ITEMS,
   BERT_EMBEDDING_ITEMS,
+  cosineSimilarity,
+  getNearestNeighbors,
 } from './embeddings';
 import { projectEmbeddingsTo3D } from './pca';
 
@@ -117,3 +119,18 @@ test('Illustrative embeddings and PCA 3D projection separate contextual BERT ban
   assert.ok(dist(bankFinance.coords3D, money.coords3D) < dist(bankFinance.coords3D, river.coords3D));
   assert.ok(dist(bankRiver.coords3D, river.coords3D) < dist(bankRiver.coords3D, money.coords3D));
 });
+
+test('Cosine similarity and nearest neighbors accurately reflect contextual clusters', () => {
+  assert.equal(cosineSimilarity([1, 0, 0], [1, 0, 0]), 1);
+  assert.equal(cosineSimilarity([1, 0, 0], [0, 1, 0]), 0);
+
+  const bertFinanceBank = BERT_EMBEDDING_ITEMS.find((p) => p.id === 'bert-bank-finance')!;
+  const bertRiverBank = BERT_EMBEDDING_ITEMS.find((p) => p.id === 'bert-bank-river')!;
+
+  const financeNeighbors = getNearestNeighbors(bertFinanceBank, BERT_EMBEDDING_ITEMS, 3);
+  const riverNeighbors = getNearestNeighbors(bertRiverBank, BERT_EMBEDDING_ITEMS, 3);
+
+  assert.ok(financeNeighbors.every((n) => n.item.group === 'finance'));
+  assert.ok(riverNeighbors.every((n) => n.item.group === 'river'));
+});
+
