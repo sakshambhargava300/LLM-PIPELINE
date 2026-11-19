@@ -1,0 +1,6 @@
+{
+  "name": "LLM Pipeline Explorer",
+  "description": "An interactive educational website explaining how Large Language Models process text through Vocabulary Building, Character IDs, Tokenization, and Static vs Contextual Embeddings.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
